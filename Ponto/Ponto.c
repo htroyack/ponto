@@ -1,4 +1,5 @@
 #include <Windows.h>
+#include <windowsx.h>
 #include <CommCtrl.h>
 #include <Wtsapi32.h>
 #include <Strsafe.h>
@@ -8,19 +9,19 @@
 #pragma comment(lib,"Wtsapi32.lib")
 #include "resource.h"
 
-// TODO: Write logs to file
 // TODO: Coluna calculando a diferença entre timestamps
 // TODO: Events linked list
 // TODO: Time since previous event
 // TODO: Shell_NotifyIcon
-// TODO: Message Cracker Macros
-// TODO: Resizeable / MoveWndow / GetParent
 // TODO: Change Icons
 // TODO: Show message ballon on events
 // TODO: Show summary message ballon on events
 // TODO: Summary message when icon clicked
 
 HINSTANCE g_hinst;
+time_t g_startup_time;
+#define LOF_FILE_NAME "ponto.log"
+#define TIMESTAMP_SIZE 64
 #define C_COLUMNS 3
 #define EVENT_INCOMING 0
 #define EVENT_OUTGOING 1
@@ -35,31 +36,67 @@ int GetTextWidth(LPCTSTR szText)
 	return rect.right;
 }
 
-void Log(HWND hWndListView, LPTSTR lpLogMsg, int nEvent)
+LPCTSTR GetRunningTimeStr()
 {
-	static time_t first_event = 0;
+	static TCHAR elapsedstr[512];
 
 	time_t now;
 	time(&now);
 
-	if (!first_event) {
-		first_event = now;
+	if (!g_startup_time) {
+		g_startup_time = now;
 	}
 
-	TCHAR elapsedstr[512];
-	int interval = (int)difftime(now, first_event);
-	_sntprintf_s(elapsedstr, ARRAYSIZE(elapsedstr), ARRAYSIZE(elapsedstr)-1,
+	int interval = (int)difftime(now, g_startup_time);
+	_sntprintf_s(elapsedstr, ARRAYSIZE(elapsedstr), ARRAYSIZE(elapsedstr) - 1,
 		TEXT("%d hours %d minutes"),
-		(int)interval/3600,
-		(int)(interval%3600)/60);
+		(int)interval / 3600,
+		(int)(interval % 3600) / 60);
 
+	return elapsedstr;
+}
+
+LPCTSTR GetTimestampStr()
+{
+	time_t now;
+	time(&now);
+
+	static TCHAR Timestamp[TIMESTAMP_SIZE];
+	_tctime_s(Timestamp, TIMESTAMP_SIZE, &now);
+
+	for (int i = 0; Timestamp[i]; i++)
+		if (Timestamp[i] == '\n')
+			Timestamp[i] = '\0';
+
+	return Timestamp;
+}
+
+BOOL LogFileAppend(LPCTSTR Timestamp, LPCTSTR RunningTime, LPCTSTR lpLogMsg)
+{
+	FILE* LogFile = NULL;
+	if (fopen_s(&LogFile, LOF_FILE_NAME, "a+") != 0)
+		return FALSE;
+
+	_ftprintf(LogFile, TEXT("[%s] %s %s\n"), Timestamp, RunningTime, lpLogMsg);
+
+	fclose(LogFile);
+
+	return TRUE;
+}
+
+void Log(HWND hWndListView, LPTSTR lpLogMsg, int nEvent)
+{
+	LPCTSTR Timestamp = GetTimestampStr();
+	LPCTSTR RunningTime = GetRunningTimeStr();
 	LVITEM item = { 0 };
 	item.mask = LVIF_TEXT | LVIF_IMAGE;
 	item.iImage = nEvent;
 	item.pszText = lpLogMsg;
 	ListView_InsertItem(hWndListView, &item);
-	ListView_SetItemText(hWndListView, 0, 1, _tctime(&now));
-	ListView_SetItemText(hWndListView, 0, 2, elapsedstr);
+	ListView_SetItemText(hWndListView, 0, 1, (LPTSTR)Timestamp);
+	ListView_SetItemText(hWndListView, 0, 2, (LPTSTR)RunningTime);
+
+	LogFileAppend(Timestamp, RunningTime, lpLogMsg);
 }
 
 void Arrive(HWND hWndListView, LPTSTR lpLogMsg)
@@ -141,7 +178,7 @@ BOOL RegisterAutorun()
 		return FALSE;
 	}
 
-	RegSetValueEx(hKey, TEXT("Ponto"), 0, REG_SZ, (CONST BYTE*)szRegDataValue, nRegDataLen);
+	RegSetValueEx(hKey, TEXT("Ponto"), 0, REG_SZ, (CONST BYTE*)szRegDataValue, (DWORD)nRegDataLen);
 
 	RegCloseKey(hKey);
 
@@ -192,63 +229,137 @@ void ShellNotifyIconDel(HWND hWnd)
 	Shell_NotifyIcon(NIM_DELETE, &nid);
 }
 
-INT_PTR CALLBACK PontoDlgProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
+HWND InitStatusBar(HWND hwndParent, HMENU idStatus, HINSTANCE hinst)
 {
-	static HWND hWndListView = NULL;
+	HWND hwndStatus;
+	INT nParts = -1;
 
+	// Create the status bar.
+	hwndStatus = CreateWindowEx(
+		0,                       // no extended styles
+		STATUSCLASSNAME,         // name of status bar class
+		(PCTSTR)NULL,            // no text when first created
+		SBARS_SIZEGRIP |         // includes a sizing grip
+		WS_CHILD | WS_VISIBLE,   // creates a visible child window
+		0, 0, 0, 0,              // ignores size and position
+		hwndParent,              // handle to parent window
+		idStatus,                // child window identifier
+		hinst,                   // handle to application instance
+		NULL);                   // no window creation data
+
+	// Tell the status bar to create the window parts.
+	SendMessage(hwndStatus, SB_SETPARTS, 1, (LPARAM)&nParts);
+
+	return hwndStatus;
+}
+
+void OnSize(HWND hWnd, UINT state, int cx, int cy)
+{
+	// TODO: remove GetClientRect and use cx,cy
+	RECT rcStatus;
+	RECT rcClient;
+	HWND hStatus = GetDlgItem(hWnd, IDC_STATUS);
+	SendMessage(hStatus, WM_SIZE, 0, 0);
+	GetWindowRect(hStatus, &rcStatus);
+	GetClientRect(hWnd, &rcClient);
+	SetWindowPos(GetDlgItem(hWnd, IDC_LIST), NULL, 0, 0, rcClient.right,
+		rcClient.bottom - (rcStatus.bottom - rcStatus.top), SWP_NOZORDER);
+}
+
+void OnTimer(HWND hWnd, UINT id)
+{
+	time_t rawtime;
+	struct tm timeinfo;
+	time(&rawtime);
+	localtime_s(&timeinfo, &rawtime);
+	if (!timeinfo.tm_hour) {
+		g_startup_time = 0;
+	}
+
+	SendDlgItemMessage(hWnd, IDC_STATUS, SB_SETTEXT, MAKEWPARAM(0, 0),
+		(LPARAM)GetRunningTimeStr());
+}
+
+void OnClose(HWND hWnd)
+{
+	Depart(GetDlgItem(hWnd, IDC_LIST), TEXT("WM_CLOSE"));
+	ShellNotifyIconDel(hWnd);
+	DestroyWindow(hWnd);
+}
+
+BOOL OnQueryEndSession(HWND hWnd)
+{
+	Depart(GetDlgItem(hWnd, IDC_LIST), TEXT("Logoff"));
+	return TRUE;
+}
+
+BOOL OnInitDialog(HWND hWnd, HWND hwndFocus, LPARAM lParam)
+{
+	HWND hWndListView = GetDlgItem(hWnd, IDC_LIST);
+	InitListViewImageLists(hWndListView);
+	InitListViewColumns(hWndListView);
+	InitStatusBar(hWnd, (HMENU)IDC_STATUS, g_hinst);
+	OnSize(hWnd, SIZE_RESTORED, 0, 0);
+	WTSRegisterSessionNotification(hWnd, NOTIFY_FOR_THIS_SESSION);
+	RegisterAutorun();
+	ShellNotifyIconAdd(hWnd);
+	SetTimer(hWnd, 0, 60000, NULL);
+	Arrive(hWndListView, TEXT("Logon"));
+
+	return TRUE;
+}
+
+#define HANDLE_WM_WTSSESSION_CHANGE(hWnd, wParam, lParam, fn) \
+    ((fn)((hWnd), (UINT)(wParam), (LONG_PTR)(lParam)), 0L)
+
+void OnWTSSessionChange(HWND hWnd, UINT_PTR reason, LONG_PTR nSssionId)
+{
+	switch (reason)
+	{
+	case WTS_SESSION_LOCK:
+		Depart(GetDlgItem(hWnd, IDC_LIST), TEXT("WTS_SESSION_LOCK"));
+		break;
+	case WTS_SESSION_UNLOCK:
+		Arrive(GetDlgItem(hWnd, IDC_LIST), TEXT("WTS_SESSION_UNLOCK"));
+		break;
+	}
+}
+
+void OnCommand(HWND hWnd, int id, HWND hwndCtl, UINT codeNotify)
+{
+	switch (id) {
+	case ID_HELP_ABOUT:
+		MessageBox(hWnd, TEXT("Ponto about box."), TEXT("Ponto"), MB_OK | MB_ICONINFORMATION);
+		break;
+	case ID_FILE_EXIT:
+		SendMessage(hWnd, WM_CLOSE, 0, 0);
+		break;
+	}
+}
+
+INT_PTR CALLBACK PontoDlgProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
 	switch (uMsg)
 	{
-	case WM_INITDIALOG:
-		hWndListView = GetDlgItem(hwndDlg, IDC_LIST);
-		InitListViewImageLists(hWndListView);
-		InitListViewColumns(hWndListView);
-		WTSRegisterSessionNotification(hwndDlg, NOTIFY_FOR_THIS_SESSION);
-		RegisterAutorun();
-		ShellNotifyIconAdd(hwndDlg);
-		SetTimer(hwndDlg, 0, 600000, NULL);
-		Arrive(hWndListView, TEXT("Logon"));
-		return TRUE;
-		break;
-	case WM_TIMER:
-	{
-		time_t rawtime;
-		struct tm * timeinfo;
-		time(&rawtime);
-		timeinfo = localtime(&rawtime);
-		if (!timeinfo->tm_hour) {
-			// TODO: Clear events by midnight
-		}
-	}
-		break;
+	HANDLE_MSG(hWnd, WM_INITDIALOG, OnInitDialog);
+	HANDLE_MSG(hWnd, WM_SIZE, OnSize);
+	HANDLE_MSG(hWnd, WM_TIMER, OnTimer);
+	HANDLE_MSG(hWnd, WM_QUERYENDSESSION, OnQueryEndSession);
+	HANDLE_MSG(hWnd, WM_CLOSE, OnClose);
+	HANDLE_MSG(hWnd, WM_COMMAND, OnCommand);
+	HANDLE_MSG(hWnd, WM_WTSSESSION_CHANGE, OnWTSSessionChange);
 	case WMAPP_NOTIFYCALLBACK:
 		switch (LOWORD(lParam))
 		{
 		case WM_LBUTTONUP:
 			// MessageBox(NULL, TEXT("WM_LBUTTONUP"), TEXT("WMAPP_NOTIFYCALLBACK"), MB_OK | MB_ICONINFORMATION);
+			ShowWindow(hWnd, IsWindowVisible(hWnd) ? SW_HIDE : SW_SHOW);
+			break;
 		case WM_RBUTTONUP:
 			// MessageBox(NULL, TEXT("WM_RBUTTONUP"), TEXT("WMAPP_NOTIFYCALLBACK"), MB_OK | MB_ICONINFORMATION);
-			ShowWindow(hwndDlg, IsWindowVisible(hwndDlg)?SW_HIDE:SW_SHOW);
+			ShowWindow(hWnd, IsWindowVisible(hWnd)?SW_HIDE:SW_SHOW);
 			break;
 		}
-		break;
-	case WM_QUERYENDSESSION:
-		Depart(hWndListView, TEXT("Logoff"));
-		break;
-	case WM_WTSSESSION_CHANGE:
-		switch (wParam)
-		{
-		case WTS_SESSION_LOCK:
-			Depart(hWndListView, TEXT("WTS_SESSION_LOCK"));
-			break;
-		case WTS_SESSION_UNLOCK:
-			Arrive(hWndListView, TEXT("WTS_SESSION_UNLOCK"));
-			break;
-		}
-		break;
-	case WM_CLOSE:
-		ShellNotifyIconDel(hwndDlg);
-		DestroyWindow(hwndDlg);
-		return TRUE;
 		break;
 	}
 
